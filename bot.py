@@ -36,10 +36,18 @@ logger = logging.getLogger(__name__)
 
 # ─── HTTP HELPER ─────────────────────────────────────────────────────────────
 
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+}
+
+
 async def fetch(session, url, params=None, headers=None, json_body=None, method="GET", timeout=12):
+    merged_headers = {**DEFAULT_HEADERS, **(headers or {})}
     try:
         if method == "POST":
-            async with session.post(url, headers=headers, json=json_body,
+            async with session.post(url, headers=merged_headers, json=json_body,
                                      timeout=aiohttp.ClientTimeout(total=30)) as r:
                 if r.status == 200:
                     return await r.json()
@@ -47,7 +55,7 @@ async def fetch(session, url, params=None, headers=None, json_body=None, method=
                     text = await r.text()
                     logger.warning(f"POST {url} status {r.status}: {text[:200]}")
         else:
-            async with session.get(url, params=params, headers=headers,
+            async with session.get(url, params=params, headers=merged_headers,
                                     timeout=aiohttp.ClientTimeout(total=timeout)) as r:
                 if r.status == 200:
                     return await r.json()
