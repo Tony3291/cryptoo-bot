@@ -17,14 +17,14 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8650706334:AAHJQrBxkw-zOw286H
 GROQ_API_KEY   = os.environ.get("GROQ_API_KEY",   "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")
 ALLOWED_CHAT   = int(os.environ.get("ALLOWED_CHAT", "5214099942"))
 
-BYBIT_BASE = "https://api.bybit.com"
+OKX_BASE = "https://www.okx.com"
 CRYPTOCOMPARE_NEWS = "https://min-api.cryptocompare.com/data/v2/news/"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-# Bybit kline interval codes
+# OKX kline "bar" codes
 INTERVAL_MAP = {
-    "1m": "1", "5m": "5", "15m": "15", "30m": "30",
-    "1h": "60", "4h": "240", "1d": "D",
+    "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+    "1h": "1H", "4h": "4H", "1d": "1D",
 }
 
 logging.basicConfig(
@@ -161,20 +161,20 @@ TIMEFRAMES = {
 }
 
 
-async def fetch_klines(session, symbol, interval_label, limit, category):
-    """Fetch klines from Bybit. Returns list of [start, open, high, low, close, volume, turnover]
+async def fetch_klines(session, instId, interval_label, limit):
+    """Fetch candles from OKX. Returns list of [ts, open, high, low, close, vol, ...]
     in ascending (oldest-first) order, or None."""
-    interval = INTERVAL_MAP.get(interval_label)
-    if not interval:
+    bar = INTERVAL_MAP.get(interval_label)
+    if not bar:
         return None
-    data = await fetch(session, f"{BYBIT_BASE}/v5/market/kline",
-                        {"category": category, "symbol": symbol, "interval": interval, "limit": limit})
-    if not data or data.get("retCode") != 0:
+    data = await fetch(session, f"{OKX_BASE}/api/v5/market/candles",
+                        {"instId": instId, "bar": bar, "limit": limit})
+    if not data or data.get("code") != "0":
         return None
-    rows = data.get("result", {}).get("list", [])
+    rows = data.get("data", [])
     if not rows:
         return None
-    return list(reversed(rows))  # Bybit returns newest-first; flip to oldest-first
+    return list(reversed(rows))  # OKX returns newest-first; flip to oldest-first
 
 
 def calc_range(klines):
@@ -191,9 +191,9 @@ def calc_range(klines):
     return {"high": high, "low": low, "move_pct": move_pct, "range_pct": range_pct}
 
 
-async def get_multi_timeframe_ranges(session, symbol, category):
+async def get_multi_timeframe_ranges(session, instId):
     tasks = {
-        label: fetch_klines(session, symbol, interval, limit, category)
+        label: fetch_klines(session, instId, interval, limit)
         for label, (interval, limit) in TIMEFRAMES.items()
     }
     results = await asyncio.gather(*tasks.values())
@@ -204,64 +204,71 @@ async def get_multi_timeframe_ranges(session, symbol, category):
     return ranges
 
 
-# ─── BYBIT DATA FETCHERS ──────────────────────────────────────────────────────
+# ─── OKX DATA FETCHERS ────────────────────────────────────────────────────────
 
-async def get_ticker(session, symbol, category):
-    """Returns normalized ticker dict or None."""
-    data = await fetch(session, f"{BYBIT_BASE}/v5/market/tickers",
-                        {"category": category, "symbol": symbol})
-    if not data or data.get("retCode") != 0:
+async def get_ticker(session, instId):
+    """Returns raw OKX ticker dict or None."""
+    data = await fetch(session, f"{OKX_BASE}/api/v5/market/ticker", {"instId": instId})
+    if not data or data.get("code") != "0":
         return None
-    lst = data.get("result", {}).get("list", [])
+    lst = data.get("data", [])
     return lst[0] if lst else None
 
 
 def normalize_ticker(t):
-    """Convert a Bybit ticker dict to a common shape used by the report builders."""
+    """Convert an OKX ticker dict to a common shape used by the report builders."""
     if not t:
         return None
     try:
-        pct = float(t.get("price24hPcnt", 0)) * 100
+        last = float(t.get("last", 0))
+        open24h = float(t.get("open24h", 0))
+        pct = ((last - open24h) / open24h * 100) if open24h else 0
     except (TypeError, ValueError):
         pct = 0
     return {
-        "lastPrice": t.get("lastPrice"),
+        "lastPrice": t.get("last"),
         "priceChangePercent": str(pct),
-        "highPrice": t.get("highPrice24h"),
-        "lowPrice": t.get("lowPrice24h"),
-        "quoteVolume": t.get("turnover24h"),
+        "highPrice": t.get("high24h"),
+        "lowPrice": t.get("low24h"),
+        "quoteVolume": t.get("volCcy24h"),
     }
 
 
-async def get_market_snapshot(session, symbol):
+async def get_market_snapshot(session, coin):
     """Fetch tickers, futures extras and trend klines in parallel."""
-    tasks = [
-        get_ticker(session, symbol, "spot"),    # 0 spot ticker (raw)
-        get_ticker(session, symbol, "linear"),  # 1 futures ticker (raw)
-    ]
-    spot_raw, fut_raw = await asyncio.gather(*tasks)
+    spot_inst = f"{coin}-USDT"
+    swap_inst = f"{coin}-USDT-SWAP"
+
+    spot_raw, fut_raw = await asyncio.gather(
+        get_ticker(session, spot_inst),
+        get_ticker(session, swap_inst),
+    )
 
     on_fut = fut_raw is not None
-    category = "linear" if on_fut else "spot"
+    primary_inst = swap_inst if on_fut else spot_inst
 
     extra_tasks = [
-        fetch_klines(session, symbol, "4h", 100, category),  # 2 4H klines
-        fetch_klines(session, symbol, "1h", 100, category),  # 3 1H klines
+        fetch_klines(session, primary_inst, "4h", 100),  # 0 4H klines
+        fetch_klines(session, primary_inst, "1h", 100),  # 1 1H klines
     ]
     if on_fut:
-        extra_tasks.append(
-            fetch(session, f"{BYBIT_BASE}/v5/market/account-ratio",
-                  {"category": "linear", "symbol": symbol, "period": "1h", "limit": 1})  # 4 L/S ratio
-        )
+        extra_tasks.append(fetch(session, f"{OKX_BASE}/api/v5/public/funding-rate",
+                                  {"instId": swap_inst}))                       # 2 funding
+        extra_tasks.append(fetch(session, f"{OKX_BASE}/api/v5/public/open-interest",
+                                  {"instId": swap_inst}))                       # 3 open interest
+        extra_tasks.append(fetch(session, f"{OKX_BASE}/api/v5/rubik-stat/contracts/long-short-account-ratio",
+                                  {"ccy": coin, "period": "5m"}))               # 4 L/S ratio
 
     extra_results = await asyncio.gather(*extra_tasks, return_exceptions=True)
     extra_results = [r if not isinstance(r, Exception) else None for r in extra_results]
 
     k4h = extra_results[0]
     k1h = extra_results[1]
-    ls_data = extra_results[2] if on_fut else None
+    funding_data = extra_results[2] if on_fut else None
+    oi_data = extra_results[3] if on_fut else None
+    ls_data = extra_results[4] if on_fut else None
 
-    return spot_raw, fut_raw, ls_data, k4h, k1h, on_fut, category
+    return spot_raw, fut_raw, funding_data, oi_data, ls_data, k4h, k1h, on_fut, primary_inst
 
 
 # ─── SIGNAL GENERATION ───────────────────────────────────────────────────────
@@ -569,32 +576,33 @@ def build_context_news_section(coin, atr_4h, price, score, trend_4h, trend_24h, 
 # ─── MAIN ANALYSIS BUILDER ───────────────────────────────────────────────────
 
 async def build_full_report(symbol_input: str):
-    symbol = symbol_input.upper().strip().lstrip("/")
-    if not symbol.endswith("USDT"):
-        symbol += "USDT"
-    coin = symbol.replace("USDT", "")
+    raw = symbol_input.upper().strip().lstrip("/")
+    coin = raw[:-4] if raw.endswith("USDT") else raw
+    symbol = coin + "USDT"
 
     async with aiohttp.ClientSession() as session:
-        spot_raw, fut_raw, ls_data, k4h, k1h, on_fut, category = await get_market_snapshot(session, symbol)
+        spot_raw, fut_raw, funding_data, oi_data, ls_data, k4h, k1h, on_fut, primary_inst = \
+            await get_market_snapshot(session, coin)
 
     on_spot = spot_raw is not None
 
     if not on_spot and not on_fut:
-        return [f"❌ {symbol} not found on Bybit.\nTry: /BTC /ETH /SOL /PEPE"]
+        return [f"❌ {symbol} not found on OKX.\nTry: /BTC /ETH /SOL /PEPE"]
 
     spot_t = normalize_ticker(spot_raw)
     fut_t = normalize_ticker(fut_raw)
 
     primary_raw = fut_raw if on_fut else spot_raw
-    price = float(primary_raw["lastPrice"])
+    norm_primary = normalize_ticker(primary_raw)
+    price = float(norm_primary["lastPrice"])
     try:
-        ch24 = float(primary_raw.get("price24hPcnt", 0)) * 100
+        ch24 = float(norm_primary["priceChangePercent"])
     except (TypeError, ValueError):
         ch24 = 0
 
     async with aiohttp.ClientSession() as session:
-        # Multi-timeframe ranges (primary category)
-        ranges_primary = await get_multi_timeframe_ranges(session, symbol, category)
+        # Multi-timeframe ranges (primary instrument)
+        ranges_primary = await get_multi_timeframe_ranges(session, primary_inst)
         ranges_fut = ranges_primary if on_fut else {}
         ranges_spot = ranges_primary if not on_fut else {}
 
@@ -611,23 +619,27 @@ async def build_full_report(symbol_input: str):
         funding = None
         oi = None
         ls_ratio = None
-        if on_fut and fut_raw:
-            try:
-                funding = float(fut_raw.get("fundingRate", 0))
-            except (TypeError, ValueError):
-                funding = None
-            try:
-                oi = float(fut_raw.get("openInterest", 0))
-            except (TypeError, ValueError):
-                oi = None
-            if isinstance(ls_data, dict) and ls_data.get("retCode") == 0:
-                lst = ls_data.get("result", {}).get("list", [])
+        if on_fut:
+            if isinstance(funding_data, dict) and funding_data.get("code") == "0":
+                lst = funding_data.get("data", [])
                 if lst:
                     try:
-                        b = float(lst[0].get("buyRatio", 0))
-                        s = float(lst[0].get("sellRatio", 0))
-                        ls_ratio = (b / s) if s else None
-                    except (TypeError, ValueError, ZeroDivisionError):
+                        funding = float(lst[0].get("fundingRate", 0))
+                    except (TypeError, ValueError):
+                        funding = None
+            if isinstance(oi_data, dict) and oi_data.get("code") == "0":
+                lst = oi_data.get("data", [])
+                if lst:
+                    try:
+                        oi = float(lst[0].get("oiCcy", lst[0].get("oi", 0)))
+                    except (TypeError, ValueError):
+                        oi = None
+            if isinstance(ls_data, dict) and ls_data.get("code") == "0":
+                lst = ls_data.get("data", [])
+                if lst:
+                    try:
+                        ls_ratio = float(lst[0][1])
+                    except (TypeError, ValueError, IndexError):
                         ls_ratio = None
 
         # News + sentiment
